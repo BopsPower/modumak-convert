@@ -318,6 +318,18 @@ async function phase2(job) {
 }
 
 const AUDIO_FIRST = process.env.AUDIO_FIRST !== '0'
+// 소리 만들기: MuseScore MP3 내보내기는 이 작은 서버에서 곡당 1~3분(11/12 측정) → MIDI를 FluidSynth(GM 사운드폰트)로 몇 초 만에 소리로.
+// 마디 시각(mpos)과 MIDI는 같은 MuseScore가 만들어 박자가 같음. FluidSynth가 없으면 예전처럼 MuseScore MP3
+const SF2 = process.env.SF2 || '/usr/share/sounds/sf2/FluidR3_GM.sf2'
+async function hasFluid() {
+  try { await run('which', ['fluidsynth']); await run('which', ['lame']); await fs.access(SF2); return true } catch { return false }
+}
+let FLUID = null
+async function midiToMp3(work) {
+  await run('fluidsynth', ['-ni', '-g', '0.8', '-r', '44100', '-F', 'score.wav', SF2, 'score.mid'], { cwd: work, timeout: 300000, maxBuffer: 8 * 1024 * 1024 })
+  await run('lame', ['--quiet', '-V', '5', 'score.wav', 'score.mp3'], { cwd: work, timeout: 300000 })
+  await fs.rm(path.join(work, 'score.wav'), { force: true })
+}
 
 // 소리 단계(빠른 공개): 소리(MP3) + 마디 시각(measures.json) → 'done'. 작업 폴더는 바로 지움(수천 개 줄 서도 디스크가 안 참)
 async function phaseAudio(score) {
@@ -336,11 +348,21 @@ async function phaseAudio(score) {
     const { inName } = await prepare(score, work)
     const base = `out/${id}`
     const t0 = Date.now()
-    const errors = await exportAll(inName, ['score.mpos', 'score.mp3'], work)
+    if (FLUID === null) { FLUID = await hasFluid(); log('소리 만들기 방식', FLUID ? 'FluidSynth(MIDI → MP3)' : 'MuseScore MP3') }
+    const errors = await exportAll(inName, FLUID ? ['score.mpos', 'score.mid'] : ['score.mpos', 'score.mp3'], work)
+    if (FLUID && (await exists(path.join(work, 'score.mid')))) {
+      try { await midiToMp3(work) } catch (e) { errors.push('fluidsynth: ' + String(e.message).split('\n')[0]) }
+    }
+    if (!(await exists(path.join(work, 'score.mp3')))) {
+      // FluidSynth가 안 되면 MuseScore로 한 번 더
+      try { await mscore(['-o', 'score.mp3', inName], work) } catch (e) { errors.push('score.mp3: ' + e.message.split('\n')[0]) }
+    }
     const files = await fs.readdir(work)
     if (!files.includes('score.mp3')) throw new Error('소리 파일 없음: ' + errors.join(' | '))
+    if (files.includes('score.mid')) { await upload(`${base}/score.mid`, path.join(work, 'score.mid'), 'audio/midi') }
     await upload(`${base}/score.mp3`, path.join(work, 'score.mp3'), 'audio/mpeg')
     const patch = { convert_status: 'done', convert_error: null, mp3_path: `${base}/score.mp3`, converted_at: new Date().toISOString() }
+    if (files.includes('score.mid')) patch.midi_path = `${base}/score.mid`
     if (files.includes('score.mpos')) {
       try {
         const mj = parseMpos(await fs.readFile(path.join(work, 'score.mpos'), 'utf8'), [{ w: 1, h: 1 }])
@@ -373,7 +395,7 @@ async function phaseExtras(job) {
     const { inName } = await prepare(score, work)
     const base = `out/${id}`
     const t0 = Date.now()
-    const errors = await exportAll(inName, ['score.pdf', 'score.mid'], work)
+    const errors = await exportAll(inName, ['score.pdf'], work)
     const patch = {}
     if (await exists(path.join(work, 'score.pdf'))) { await upload(`${base}/score.pdf`, path.join(work, 'score.pdf'), 'application/pdf'); patch.pdf_path = `${base}/score.pdf` }
     if (await exists(path.join(work, 'score.mid'))) { await upload(`${base}/score.mid`, path.join(work, 'score.mid'), 'audio/midi'); patch.midi_path = `${base}/score.mid` }
