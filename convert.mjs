@@ -408,6 +408,29 @@ async function phaseExtras(job) {
   }
 }
 
+// 대표 11/12 04:5x "이어서 변환": 곡 악보(pending)가 다 끝나면, 모두플레이에서 가져와 보류(hold)해 둔 악보를 50개씩 pending으로
+// — 파트(밴드곡 '내 악기 빼고 듣기'용) 먼저, 그다음 곡에 안 묶인 원본. 11/12에 가져온 묶음만(그 뒤에 보류한 악보는 그대로 보류)
+const PROMOTE_BEFORE = '2026-11-12T16:00:00Z'
+let promoteDone = false
+async function promoteHold() {
+  if (promoteDone) return 0
+  for (const parts of [true, false]) {
+    let q = sb.from('scores').select('id').eq('convert_status', 'hold').like('file_path', 'src/ss/%').lt('created_at', PROMOTE_BEFORE)
+    q = parts ? q.not('parent_id', 'is', null) : q.is('parent_id', null)
+    const { data, error } = await q.order('created_at').limit(50)
+    if (error) { log('보류 악보 조회 실패', error.message); return 0 }
+    if (data?.length) {
+      const { error: e2 } = await sb.from('scores').update({ convert_status: 'pending' }).in('id', data.map(r => r.id)).eq('convert_status', 'hold')
+      if (e2) { log('보류 악보 올리기 실패', e2.message); return 0 }
+      log('보류 악보 차례로 올림', parts ? '파트' : '원본', data.length, '개')
+      return data.length
+    }
+  }
+  promoteDone = true
+  log('보류 악보 모두 올림(끝)')
+  return 0
+}
+
 // 줄 서기: 새로 올라온 악보의 1단계를 항상 먼저. 2단계(소리)는 1단계 줄이 비었을 때 하나씩.
 const later = []
 let busy = false
@@ -430,6 +453,7 @@ async function tick() {
         }
         continue
       }
+      if (!(data ?? []).length && await promoteHold()) continue
       const job = later.shift()
       if (!job) break
       if (job.extras) await phaseExtras(job)
