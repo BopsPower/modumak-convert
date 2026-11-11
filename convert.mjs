@@ -2,6 +2,8 @@
 // - Supabase에서 convert_status = 'pending' 인 악보를 20초마다 확인
 // - MuseScore 4로 PDF / PNG(페이지별) / MP3 / MusicXML 생성 → storage 'scores' 버킷에 업로드
 // - 완료되면 scores 행을 갱신
+// - 2026-11-12 소리 먼저(AUDIO_FIRST, 기본 켬): modumak 화면은 브라우저 SVG(Verovio)라 학생에게 필요한 건 소리(MP3)·마디 시각(measures.json)뿐
+//   → 악보마다 소리·마디 시각만 먼저 만들어 'done', PDF·MIDI(관리자·유료 인쇄용)는 줄이 비었을 때. 쪽 그림(PNG)은 안 만듦
 import { createClient } from '@supabase/supabase-js'
 import WebSocket from 'ws'
 import { execFile } from 'node:child_process'
@@ -315,6 +317,75 @@ async function phase2(job) {
   }
 }
 
+const AUDIO_FIRST = process.env.AUDIO_FIRST !== '0'
+
+// 소리 단계(빠른 공개): 소리(MP3) + 마디 시각(measures.json) → 'done'. 작업 폴더는 바로 지움(수천 개 줄 서도 디스크가 안 참)
+async function phaseAudio(score) {
+  const id = score.id
+  const { data: now } = await sb.from('scores').select('convert_status').eq('id', id).maybeSingle()
+  if (!now || now.convert_status !== 'pending') { log('건너뜀(이미 처리됨)', id, score.title); return 'skip' }
+  if (/\.pdf$/i.test(score.file_path)) {
+    await sb.from('scores').update({ convert_status: 'done', pdf_path: score.file_path, converted_at: new Date().toISOString(),
+      convert_error: 'PDF 원본: 보기만 가능 (재생·마디 이동 없음)' }).eq('id', id)
+    return null
+  }
+  log('소리 단계 시작', id, score.title)
+  await sb.from('scores').update({ convert_status: 'converting', convert_error: null }).eq('id', id)
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'mp-'))
+  try {
+    const { inName } = await prepare(score, work)
+    const base = `out/${id}`
+    const t0 = Date.now()
+    const errors = await exportAll(inName, ['score.mpos', 'score.mp3'], work)
+    const files = await fs.readdir(work)
+    if (!files.includes('score.mp3')) throw new Error('소리 파일 없음: ' + errors.join(' | '))
+    await upload(`${base}/score.mp3`, path.join(work, 'score.mp3'), 'audio/mpeg')
+    const patch = { convert_status: 'done', convert_error: null, mp3_path: `${base}/score.mp3`, converted_at: new Date().toISOString() }
+    if (files.includes('score.mpos')) {
+      try {
+        const mj = parseMpos(await fs.readFile(path.join(work, 'score.mpos'), 'utf8'), [{ w: 1, h: 1 }])
+        mj.coords = false // 화면은 SVG가 그림 → 좌표는 안 씀, 마디 시각(t)만 씀
+        await fs.writeFile(path.join(work, 'measures.json'), JSON.stringify(mj))
+        await upload(`${base}/measures.json`, path.join(work, 'measures.json'), 'application/json')
+        patch.measures_path = `${base}/measures.json`
+      } catch (e) { errors.push('measures: ' + e.message) }
+    }
+    if (errors.length) patch.convert_error = ('일부 형식 실패 — ' + errors.join(' | ')).slice(0, 500)
+    const { error } = await sb.from('scores').update(patch).eq('id', id)
+    if (error) throw new Error('DB 갱신 실패: ' + error.message)
+    log('소리 단계 완료', id, `${Math.round((Date.now() - t0) / 1000)}초 — 학생 재생 가능`)
+    return { score, work: null, extras: true }
+  } catch (err) {
+    log('변환 실패', id, err.message)
+    await sb.from('scores').update({ convert_status: 'failed', convert_error: String(err.message).slice(0, 500) }).eq('id', id)
+    return null
+  } finally {
+    await fs.rm(work, { recursive: true, force: true })
+  }
+}
+
+// 나중 단계(줄이 비었을 때): PDF·MIDI — 관리자 내려받기·유료 인쇄·실제 악기 소리(샘플)용. 소리·상태는 건드리지 않음
+async function phaseExtras(job) {
+  const { score } = job
+  const id = score.id
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'mp-'))
+  try {
+    const { inName } = await prepare(score, work)
+    const base = `out/${id}`
+    const t0 = Date.now()
+    const errors = await exportAll(inName, ['score.pdf', 'score.mid'], work)
+    const patch = {}
+    if (await exists(path.join(work, 'score.pdf'))) { await upload(`${base}/score.pdf`, path.join(work, 'score.pdf'), 'application/pdf'); patch.pdf_path = `${base}/score.pdf` }
+    if (await exists(path.join(work, 'score.mid'))) { await upload(`${base}/score.mid`, path.join(work, 'score.mid'), 'audio/midi'); patch.midi_path = `${base}/score.mid` }
+    if (Object.keys(patch).length) await sb.from('scores').update(patch).eq('id', id)
+    log('나중 단계 완료', id, Object.keys(patch).join(','), `${Math.round((Date.now() - t0) / 1000)}초`, errors.length ? `(실패 ${errors.length}개)` : '')
+  } catch (err) {
+    log('나중 단계 실패', id, err.message)
+  } finally {
+    await fs.rm(work, { recursive: true, force: true })
+  }
+}
+
 // 줄 서기: 새로 올라온 악보의 1단계를 항상 먼저. 2단계(소리)는 1단계 줄이 비었을 때 하나씩.
 const later = []
 let busy = false
@@ -330,7 +401,7 @@ async function tick() {
       if (fresh.length) {
         for (const s of fresh) {
           seen.add(s.id)
-          const job = await phase1(s)
+          const job = AUDIO_FIRST ? await phaseAudio(s) : await phase1(s)
           // 건너뛴 악보는 '이번 차례 처리함'에서 빼 둠 → 그사이 다시 공개(pending)되면 같은 차례 안에서도 바로 잡음
           if (job === 'skip') seen.delete(s.id)
           else if (job) later.push(job)
@@ -339,13 +410,25 @@ async function tick() {
       }
       const job = later.shift()
       if (!job) break
-      await phase2(job)
+      if (job.extras) await phaseExtras(job)
+      else await phase2(job)
     }
   } finally { busy = false }
 }
 
 // 서버가 2단계 도중에 재시작됐던 악보(페이지는 있는데 소리·오류 기록이 없음)를 다시 줄에 세움
 async function recover() {
+  if (AUDIO_FIRST) {
+    // 소리는 있는데 PDF·MIDI가 아직 없는 악보 → 나중 단계 줄에 (재시작해도 이어서)
+    for (let from = 0; ; from += 1000) {
+      const { data } = await sb.from('scores').select('id, title, composer, file_path, major')
+        .eq('convert_status', 'done').not('mp3_path', 'is', null).is('pdf_path', null).order('created_at').range(from, from + 999)
+      for (const s of data ?? []) if (!/\.pdf$/i.test(s.file_path)) later.push({ score: s, work: null, extras: true })
+      if (!data || data.length < 1000) break
+    }
+    if (later.length) log('나중 단계 줄 세움', later.length, '개')
+    return
+  }
   const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString()
   const { data } = await sb.from('scores').select('id, title, composer, file_path, major')
     .eq('convert_status', 'done').is('mp3_path', null).is('convert_error', null).gte('created_at', since)
